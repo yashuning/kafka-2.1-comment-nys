@@ -194,17 +194,25 @@ public final class RecordAccumulator {
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
             // check if we have an in-progress batch
+            // 如果一个topicPartition不存在Deque<RecordBatch>就会创建，如果存在，就会从batchs中获取
+            // 每个 topicPartition 对应一个 queue
             Deque<ProducerBatch> dq = getOrCreateDeque(tp);
-            synchronized (dq) {
+            synchronized (dq) { // 在对一个 queue 进行操作时,会保证线程安全
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
+
+                /*
+                    先获取 queue 中最新加入的那个 RecordBatch，如果不存在或者存在但剩余空余不足以添加本条 record 则返回 null，
+                    成功写入的话直接返回结果，写入成功；
+                 */
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
-                if (appendResult != null)
+                if (appendResult != null)   // 这个 topic-partition 已经有记录了
                     return appendResult;
             }
 
             // we don't have an in-progress record batch try to allocate a new batch
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+            // 为 topic-partition 创建一个新的 RecordBatch, 需要初始化相应的 RecordBatch，要为其分配的大小是: max（batch.size, 加上头文件的本条消息的大小）
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
             buffer = free.allocate(size, maxTimeToBlock);
@@ -219,15 +227,21 @@ public final class RecordAccumulator {
                     return appendResult;
                 }
 
+                // 给 topic-partition 创建一个 RecordBatch
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
+                // 前面没有append成功，说明最后一个RecordBatch不存在或者没有容量，需要重新创建一个RecordBatch再进行append
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, time.milliseconds());
+                // 向新的 RecordBatch 中追加数据
                 FutureRecordMetadata future = Utils.notNull(batch.tryAppend(timestamp, key, value, headers, callback, time.milliseconds()));
 
+                // 将 RecordBatch 添加到对应的 queue 中
                 dq.addLast(batch);
+                // 向未 ack 的 batch 集合添加这个 batch
                 incomplete.add(batch);
 
                 // Don't deallocate this buffer in the finally block as it's being used in the record batch
                 buffer = null;
+                // 如果 dp.size()>1 就证明这个 queue 有一个 batch 是可以发送了
                 return new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true);
             }
         } finally {
@@ -257,10 +271,13 @@ public final class RecordAccumulator {
                                          Callback callback, Deque<ProducerBatch> deque) {
         ProducerBatch last = deque.peekLast();
         if (last != null) {
+            // 尝试往该 RecordBatch 末尾追加消息
             FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, time.milliseconds());
             if (future == null)
+                // 追加失败
                 last.closeForRecordAppends();
             else
+                // 追加成功，将结果封装成 RecordAppendResult 对象返回
                 return new RecordAppendResult(future, deque.size() > 1 || last.isFull(), false);
         }
         return null;
